@@ -117,6 +117,7 @@ mod bytes;
 mod cursor;
 mod data;
 mod db;
+mod dirtyio;
 mod errors;
 mod freelist;
 mod lifetimes;
@@ -129,7 +130,7 @@ mod tx;
 pub use bucket::Bucket;
 pub use cursor::{Buckets, Cursor, KVPairs, ToBuckets, ToKVPairs};
 pub use data::*;
-pub use db::{OpenOptions, DB};
+pub use db::{OpenOptions, WriteStats, DB};
 pub use errors::*;
 pub use tx::Tx;
 

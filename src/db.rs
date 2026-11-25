@@ -191,6 +191,21 @@ pub struct DB {
     pub(crate) inner: Arc<DBInner>,
 }
 
+/// Cumulative write statistics for a [`DB`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WriteStats {
+    /// Number of successful transaction commits.
+    pub commits: u64,
+    /// Number of dirty page allocations processed by commits.
+    pub pages: u64,
+    /// Number of page/meta write requests issued.
+    pub write_requests: u64,
+    /// Bytes that would have been written by whole page-sized writes.
+    pub whole_page_bytes: u64,
+    /// Bytes actually passed to page/meta write requests.
+    pub written_bytes: u64,
+}
+
 impl DB {
     /// Opens a database using the default [`OpenOptions`].
     ///
@@ -226,6 +241,11 @@ impl DB {
         self.inner.pagesize
     }
 
+    /// Returns cumulative write amplification statistics.
+    pub fn write_stats(&self) -> WriteStats {
+        *self.inner.write_stats.lock().unwrap()
+    }
+
     #[doc(hidden)]
     pub fn check(&self) -> Result<()> {
         self.tx(false)?.check()
@@ -240,6 +260,7 @@ pub(crate) struct DBInner {
     pub(crate) flags: DBFlags,
 
     pub(crate) pagesize: u64,
+    pub(crate) write_stats: Mutex<WriteStats>,
 }
 
 impl DBInner {
@@ -256,6 +277,7 @@ impl DBInner {
             open_ro_txs: Mutex::new(Vec::new()),
 
             pagesize,
+            write_stats: Mutex::new(WriteStats::default()),
             flags,
         };
 

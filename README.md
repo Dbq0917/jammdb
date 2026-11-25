@@ -85,6 +85,20 @@ fn main() -> Result<(), Error> {
 }
 ```
 
+### Measuring write amplification
+
+The import example reports both process write counters and the database's
+coalesced-write statistics:
+
+```sh
+cargo run --release --example import_write_amp -- 10000000 100000 64 ./import.db
+cargo run --release --example update_write_amp -- 1000 10000 ./update.db
+```
+
+`DB::write_stats()` exposes the cumulative byte and request counts. Import
+workloads should batch many records in one transaction; the first example uses
+100,000-record commits by default for 10,000,000 small records.
+
 ### Storing structs
 
 ```rust

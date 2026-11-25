@@ -279,6 +279,7 @@ impl<'tx> Tx<'tx> {
 
 impl<'tx> TxInner<'tx> {
     fn write_data(&mut self, freelist: &mut TxFreelist) -> Result<()> {
+        let mut write_stats = crate::WriteStats::default();
         if let TxLock::Rw(file) = &mut self.lock {
             // Write the freelist to a new page
             {
@@ -312,8 +313,32 @@ impl<'tx> TxInner<'tx> {
                 // the random seeks.
                 for (page_id, (ptr, size)) in freelist.pages.iter() {
                     let buf = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *size) };
-                    file.seek(SeekFrom::Start(self.db.inner.pagesize * page_id))?;
-                    file.write_all(buf)?;
+                    let page_offset = self.db.inner.pagesize * page_id;
+                    let page_header = unsafe { &*(ptr.as_ptr() as *const Page) };
+                    write_stats.pages += 1;
+                    write_stats.whole_page_bytes +=
+                        (page_header.overflow + 1) * self.db.inner.pagesize;
+                    if self.db.inner.flags.direct_writes {
+                        file.seek(SeekFrom::Start(page_offset))?;
+                        file.write_all(buf)?;
+                        write_stats.write_requests += 1;
+                        write_stats.written_bytes += *size as u64;
+                        continue;
+                    }
+
+                    let mmap_offset = page_offset as usize;
+                    let range = match self.pages.data.get(mmap_offset..mmap_offset + buf.len()) {
+                        Some(old) => crate::dirtyio::dirty_span(old, buf),
+                        None => Some(0..buf.len()),
+                    };
+
+                    if let Some(range) = range {
+                        let range_len = range.len() as u64;
+                        file.seek(SeekFrom::Start(page_offset + range.start as u64))?;
+                        file.write_all(&buf[range])?;
+                        write_stats.write_requests += 1;
+                        write_stats.written_bytes += range_len;
+                    }
                 }
             }
         }
@@ -341,8 +366,18 @@ impl<'tx> TxInner<'tx> {
                 m.tx_id = self.meta.tx_id;
                 m.hash = m.hash_self();
 
+                let meta_len = std::mem::size_of::<Page>() - std::mem::size_of::<u64>()
+                    + std::mem::size_of::<Meta>();
+                write_stats.whole_page_bytes += self.db.inner.pagesize;
+                write_stats.write_requests += 1;
                 file.seek(SeekFrom::Start(self.db.inner.pagesize * meta_page_id))?;
-                file.write_all(buf.as_slice())?;
+                if self.db.inner.flags.direct_writes {
+                    file.write_all(buf.as_slice())?;
+                    write_stats.written_bytes += self.db.inner.pagesize;
+                } else {
+                    file.write_all(&buf[..meta_len])?;
+                    write_stats.written_bytes += meta_len as u64;
+                }
             }
 
             file.flush()?;
@@ -350,6 +385,12 @@ impl<'tx> TxInner<'tx> {
 
             let mut lock = self.db.inner.freelist.lock()?;
             *lock = freelist.inner.clone();
+            let mut stats = self.db.inner.write_stats.lock().unwrap();
+            stats.commits += 1;
+            stats.pages += write_stats.pages;
+            stats.write_requests += write_stats.write_requests;
+            stats.whole_page_bytes += write_stats.whole_page_bytes;
+            stats.written_bytes += write_stats.written_bytes;
             Ok(())
         } else {
             unreachable!()

@@ -32,6 +32,7 @@ impl<'a> TxFreelist {
 
     pub(crate) fn free(&mut self, page_id: PageID, num_pages: u64) {
         debug_assert!(num_pages > 0, "cannot free zero pages");
+        self.pages.remove(&page_id);
         for id in page_id..(page_id + num_pages) {
             self.inner.free(self.meta.tx_id, id);
         }
@@ -372,6 +373,10 @@ mod tests {
             freelist.inner.pages(),
             vec![80, 100, 101, 102, 103, 104, 105]
         );
+
+        freelist.pages.insert(90, (NonNull::dangling(), 1024));
+        freelist.free(90, 1);
+        assert!(!freelist.pages.contains_key(&90));
 
         Ok(())
     }
