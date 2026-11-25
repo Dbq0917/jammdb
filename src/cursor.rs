@@ -218,40 +218,36 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.c.next_called {
-            if let Bound::Included(s) = self.bounds.start_bound() {
-                let exists = self.c.seek(*s);
-                // if the start key is not there,
-                // skip to the key after where it should be.
-                if !exists {
-                    if let Some(data) = self.c.current() {
-                        if data.key() < *s {
-                            self.c.next();
-                        }
-                    }
-                }
+            if let Bound::Included(s) | Bound::Excluded(s) = self.bounds.start_bound() {
+                self.c.seek(*s);
             }
         }
-        let next = self.c.next();
-        match next {
-            Some(data) => match self.bounds.end_bound() {
-                Bound::Excluded(e) => {
-                    if data.key() < *e {
-                        Some(data)
-                    } else {
-                        None
-                    }
-                }
-                Bound::Included(e) => {
-                    if data.key() <= *e {
-                        Some(data)
-                    } else {
-                        None
-                    }
-                }
-                Bound::Unbounded => Some(data),
-            },
-            None => None,
+        loop {
+            let data = self.c.next()?;
+            if !after_start_bound(data.key(), self.bounds.start_bound()) {
+                continue;
+            }
+            if !before_end_bound(data.key(), self.bounds.end_bound()) {
+                return None;
+            }
+            return Some(data);
         }
+    }
+}
+
+fn after_start_bound<T: AsRef<[u8]>>(key: &[u8], bound: Bound<&T>) -> bool {
+    match bound {
+        Bound::Unbounded => true,
+        Bound::Included(start) => key >= start.as_ref(),
+        Bound::Excluded(start) => key > start.as_ref(),
+    }
+}
+
+fn before_end_bound<T: AsRef<[u8]>>(key: &[u8], bound: Bound<&T>) -> bool {
+    match bound {
+        Bound::Unbounded => true,
+        Bound::Included(end) => key <= end.as_ref(),
+        Bound::Excluded(end) => key < end.as_ref(),
     }
 }
 

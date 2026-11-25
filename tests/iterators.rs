@@ -1,5 +1,6 @@
 use jammdb::{Bucket, Data, Error, OpenOptions, DB};
 use rand::prelude::*;
+use std::ops::Bound;
 
 mod common;
 
@@ -278,5 +279,51 @@ fn kv_iter() -> Result<(), Error> {
             assert_eq!(v.as_bytes(), kvpair.value());
         }
     };
+    Ok(())
+}
+
+#[test]
+fn nested_bucket_range_with_excluded_start() -> Result<(), Error> {
+    let random_file = common::RandomFile::new();
+    {
+        let db = OpenOptions::new()
+            .strict_mode(true)
+            .open(&random_file.path)?;
+        let tx = db.tx(true)?;
+        let root = tx.create_bucket("root")?;
+        let nested = root.create_bucket("nested")?;
+        for i in 0..256 {
+            nested.put(format!("{:04}", i), i.to_string())?;
+        }
+        tx.commit()?;
+    }
+    {
+        let db = OpenOptions::new()
+            .strict_mode(true)
+            .open(&random_file.path)?;
+        let tx = db.tx(false)?;
+        let root = tx.get_bucket("root")?;
+        let nested = root.get_bucket("nested")?;
+
+        let mut range =
+            nested.range((Bound::Excluded(&b"0095"[..]), Bound::Excluded(&b"0105"[..])));
+        for i in 96..105 {
+            let data = range.next().unwrap();
+            assert_eq!(data.key(), format!("{:04}", i).as_bytes());
+            assert_eq!(data.kv().value(), i.to_string().as_bytes());
+        }
+        assert!(range.next().is_none());
+
+        let mut range = nested.range((
+            Bound::Excluded(&b"0095x"[..]),
+            Bound::Included(&b"0105"[..]),
+        ));
+        for i in 96..=105 {
+            let data = range.next().unwrap();
+            assert_eq!(data.key(), format!("{:04}", i).as_bytes());
+            assert_eq!(data.kv().value(), i.to_string().as_bytes());
+        }
+        assert!(range.next().is_none());
+    }
     Ok(())
 }

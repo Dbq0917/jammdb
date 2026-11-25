@@ -1007,6 +1007,7 @@ mod tests {
 
     use super::*;
     use crate::{testutil::RandomFile, DB};
+    use std::ops::Bound;
 
     #[test]
     fn bytes() {
@@ -1166,7 +1167,8 @@ mod tests {
         let db = DB::open(&random_file)?;
         {
             let tx = db.tx(true)?;
-            let b = tx.create_bucket("abc")?;
+            let root = tx.create_bucket("abc")?;
+            let b = root.create_bucket("nested")?;
             b.put("a", "1")?;
             b.put("b", "2")?;
             b.put("c", "3")?;
@@ -1178,7 +1180,8 @@ mod tests {
         macro_rules! iter_test {
             ($range:expr, $keys:expr) => {
                 let tx = db.tx(false)?;
-                let b = tx.get_bucket("abc")?;
+                let root = tx.get_bucket("abc")?;
+                let b = root.get_bucket("nested")?;
                 let mut bucket_iter = b.range($range);
                 for k in $keys {
                     let k = k.as_bytes();
@@ -1194,6 +1197,7 @@ mod tests {
         let b = "b".as_bytes();
         let d = "d".as_bytes();
         let e = "e".as_bytes();
+        let f = "f".as_bytes();
 
         iter_test!(a..e, ["a", "b", "c", "d"]);
         iter_test!(aa..e, ["b", "c", "d"]);
@@ -1207,6 +1211,17 @@ mod tests {
         iter_test!(..=e, ["a", "b", "c", "d", "e"]);
         iter_test!(..e, ["a", "b", "c", "d"]);
         iter_test!(.., ["a", "b", "c", "d", "e", "f"]);
+        iter_test!((Bound::Excluded(a), Bound::Excluded(e)), ["b", "c", "d"]);
+        iter_test!(
+            (Bound::Excluded(a), Bound::Included(e)),
+            ["b", "c", "d", "e"]
+        );
+        iter_test!((Bound::Excluded(aa), Bound::Excluded(e)), ["b", "c", "d"]);
+        iter_test!((Bound::Excluded(e), Bound::Unbounded), ["f"]);
+        iter_test!(
+            (Bound::Excluded(f), Bound::Unbounded),
+            std::iter::empty::<&str>()
+        );
 
         Ok(())
     }
