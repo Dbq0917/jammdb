@@ -170,8 +170,11 @@ impl Freelist {
     }
 
     pub(crate) fn size(&self) -> u64 {
-        let count = self.pages().len() as u64;
-        HEADER_SIZE + (PAGE_ID_SIZE * count)
+        HEADER_SIZE + (PAGE_ID_SIZE * self.len() as u64)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.free_pages.len() + self.pending_pages.values().map(Vec::len).sum::<usize>()
     }
 }
 

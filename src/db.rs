@@ -12,7 +12,12 @@ use memmap2::Mmap;
 use page_size::get as get_page_size;
 
 use crate::{
-    bucket::BucketMeta, errors::Result, freelist::Freelist, meta::Meta, page::Page, tx::Tx,
+    bucket::BucketMeta,
+    errors::Result,
+    freelist::Freelist,
+    meta::Meta,
+    page::{Page, Pages},
+    tx::{recover_freelist, Tx},
 };
 
 const MAGIC_VALUE: u32 = 0x00AB_CDEF;
@@ -262,11 +267,9 @@ impl DBInner {
         {
             let meta = db.meta()?;
             let data = db.data.lock()?;
-            let free_pages = Page::from_buf(&data, meta.freelist_page, pagesize).freelist();
-
-            if !free_pages.is_empty() {
-                db.freelist.lock()?.init(free_pages);
-            }
+            let pages = Pages::new(data.clone(), pagesize);
+            let freelist = recover_freelist(&pages, &meta)?;
+            *db.freelist.lock()? = freelist;
         }
 
         Ok(db)

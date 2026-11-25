@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fs::File,
     io::{Seek, SeekFrom, Write},
     marker::PhantomData,
@@ -14,7 +14,7 @@ use crate::{
     cursor::ToBuckets,
     db::{DB, MIN_ALLOC_SIZE},
     errors::{Error, Result},
-    freelist::TxFreelist,
+    freelist::{Freelist, TxFreelist},
     meta::Meta,
     node::Node,
     page::{Page, PageID, Pages},
@@ -135,7 +135,11 @@ impl<'tx> Tx<'tx> {
 
         let data = db.inner.data.lock()?.clone();
         let pages = Pages::new(data, db.inner.pagesize);
-        let num_freelist_pages = pages.page(meta.freelist_page).overflow + 1;
+        let num_freelist_pages = if meta.freelist_page == 0 {
+            0
+        } else {
+            pages.page(meta.freelist_page).overflow + 1
+        };
         let root = InnerBucket::from_meta(meta.root, pages.clone());
         let root = Rc::new(RefCell::new(root));
         let inner = TxInner {
@@ -280,10 +284,13 @@ impl<'tx> Tx<'tx> {
 impl<'tx> TxInner<'tx> {
     fn write_data(&mut self, freelist: &mut TxFreelist) -> Result<()> {
         if let TxLock::Rw(file) = &mut self.lock {
-            // Write the freelist to a new page
-            {
+            if self.meta.freelist_page != 0 {
                 freelist.free(self.meta.freelist_page, self.num_freelist_pages);
-                let freelist_size = freelist.inner.size();
+            }
+
+            let freelist_size = freelist.inner.size();
+            if freelist_size <= self.db.inner.pagesize {
+                // Small freelists keep the legacy complete-table format and allocation pattern.
                 let page = freelist.allocate(freelist_size)?;
                 self.meta.freelist_page = page.id;
                 let free_page_ids = freelist.inner.pages();
@@ -291,6 +298,10 @@ impl<'tx> TxInner<'tx> {
                 page.count = free_page_ids.len() as u64;
                 page.freelist_mut()
                     .copy_from_slice(free_page_ids.as_slice());
+            } else {
+                // Page 0 is a meta page and is never a freelist page. Use it as the sentinel
+                // for incremental accounting whose complete set is rebuilt after reopening.
+                self.meta.freelist_page = 0;
             }
 
             // Update our num_pages from the freelist now that we've allocated everything
@@ -318,7 +329,7 @@ impl<'tx> TxInner<'tx> {
             }
         }
         if self.db.inner.flags.strict_mode {
-            self.check()?;
+            self.check_with_freelist(Some(&freelist.inner))?;
         }
         if let TxLock::Rw(file) = &mut self.lock {
             // write meta page to file
@@ -357,10 +368,17 @@ impl<'tx> TxInner<'tx> {
     }
 
     fn check(&self) -> Result<()> {
+        let freelist = self.freelist.borrow();
+        self.check_with_freelist(Some(&freelist.inner))
+    }
+
+    fn check_with_freelist(&self, expected: Option<&Freelist>) -> Result<()> {
         let mut unused_pages: HashSet<PageID> = (2..self.meta.num_pages).collect();
         let mut page_stack = Vec::new();
         page_stack.push(self.meta.root.root_page);
-        page_stack.push(self.meta.freelist_page);
+        if self.meta.freelist_page != 0 {
+            page_stack.push(self.meta.freelist_page);
+        }
         while let Some(page_id) = page_stack.pop() {
             // Make sure this page hasn't already been used
             if !unused_pages.remove(&page_id) {
@@ -462,16 +480,99 @@ impl<'tx> TxInner<'tx> {
             }
         }
 
-        // Once we've explored all of the pages we can reach from the root bucket and freelist,
-        // If there are any pages left then we have an invalid database.
-        if !unused_pages.is_empty() {
-            return Err(Error::InvalidDB(format!(
-                "Unreachable pages {:?}",
-                unused_pages,
-            )));
+        if self.meta.freelist_page == 0 {
+            if let Some(expected) = expected {
+                let expected_pages = expected.pages();
+                let mut reconstructed_pages = unused_pages.iter().copied().collect::<Vec<_>>();
+                reconstructed_pages.sort_unstable();
+                if expected_pages != reconstructed_pages {
+                    return Err(Error::InvalidDB(format!(
+                        "Freelist mismatch: accounting has {expected_pages:?}, reconstruction has {unused_pages:?}",
+                    )));
+                }
+            }
+        } else {
+            // Once we've explored all of the pages we can reach from the root bucket and freelist,
+            // If there are any pages left then we have an invalid database.
+            if !unused_pages.is_empty() {
+                return Err(Error::InvalidDB(format!(
+                    "Unreachable pages {:?}",
+                    unused_pages,
+                )));
+            }
         }
         Ok(())
     }
+}
+
+pub(crate) fn recover_freelist(pages: &Pages, meta: &Meta) -> Result<Freelist> {
+    let free_pages = if meta.freelist_page == 0 {
+        // Every allocated page is reachable from the meta root. The complement within
+        // [2, num_pages) is therefore exactly the same set that a full freelist table stores.
+        let mut unused_pages: BTreeSet<PageID> = (2..meta.num_pages).collect();
+        let mut page_stack = vec![meta.root.root_page];
+
+        while let Some(page_id) = page_stack.pop() {
+            if !unused_pages.remove(&page_id) {
+                return Err(Error::InvalidDB(format!(
+                    "Page {} missing during freelist rebuild",
+                    page_id,
+                )));
+            }
+
+            let page = pages.page(page_id);
+            for offset in 0..page.overflow {
+                let overflow_page_id = page_id + offset + 1;
+                if !unused_pages.remove(&overflow_page_id) {
+                    return Err(Error::InvalidDB(format!(
+                        "Overflow page {} missing during freelist rebuild",
+                        overflow_page_id,
+                    )));
+                }
+            }
+
+            match page.page_type {
+                Page::TYPE_BRANCH => {
+                    for element in page.branch_elements().iter() {
+                        page_stack.push(element.page);
+                    }
+                }
+                Page::TYPE_LEAF => {
+                    for leaf in page.leaf_elements().iter() {
+                        if leaf.node_type == Node::TYPE_BUCKET {
+                            let bucket_meta: BucketMeta = leaf.value().into();
+                            page_stack.push(bucket_meta.root_page);
+                        }
+                    }
+                }
+                Page::TYPE_FREELIST => {
+                    return Err(Error::InvalidDB(format!(
+                        "Unexpected freelist page {} during rebuild",
+                        page_id,
+                    )));
+                }
+                _ => {
+                    return Err(Error::InvalidDB(format!(
+                        "Invalid page type {} for page {}",
+                        page.page_type, page_id,
+                    )))
+                }
+            }
+        }
+
+        unused_pages
+    } else {
+        Page::from_buf(&pages.data, meta.freelist_page, pages.pagesize)
+            .freelist()
+            .iter()
+            .copied()
+            .collect()
+    };
+
+    let mut freelist = Freelist::new();
+    let ids = free_pages.into_iter().collect::<Vec<_>>();
+    freelist.init(&ids);
+    Ok(freelist)
 }
 
 impl<'tx> Drop for TxInner<'tx> {
